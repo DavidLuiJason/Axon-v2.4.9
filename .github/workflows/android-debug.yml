@@ -1,0 +1,140 @@
+name: Android Debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'      # every branch, so the guard also checks anything pushed to a side branch before it is merged
+
+permissions:
+  contents: write   # only so the guard can save its file lock (tools/files.lock)
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: File guard (stops the build if any locked file is missing or a dictionary file changed)
+        run: |
+          if [ ! -f tools/guard.mjs ]; then
+            echo "::error::tools/guard.mjs is missing. Unpack axon-guard-v2_1.zip first (Actions, Unpack a zip into the repository), then run this build again."
+            exit 1
+          fi
+          node tools/guard.mjs
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Web build
+        id: webbuild
+        run: npm run build
+
+      - name: Type check
+        id: typecheck
+        continue-on-error: ${{ vars.AXON_GATE != 'on' }}
+        run: npm run lint
+
+      - name: Background tests
+        id: tests
+        continue-on-error: ${{ vars.AXON_GATE != 'on' }}
+        run: npm run test:bg
+
+      - name: Kernel tests
+        id: kerneltests
+        continue-on-error: ${{ vars.AXON_GATE != 'on' }}
+        run: npm run test:kernel
+
+      - name: Chat session tests
+        id: chattests
+        continue-on-error: ${{ vars.AXON_GATE != 'on' }}
+        run: npm run test:chat
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Apply AXON Android overlay
+        run: |
+          chmod +x scripts/apply-android-overlay.sh
+          ./scripts/apply-android-overlay.sh
+
+      - name: Sync web build into Android project
+        run: npx cap sync android
+
+      - name: Assemble debug APK
+        id: apk
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: axon-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish the APK as a release download (a plain .apk file, no zip, no sign-in needed)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="axon-debug-${{ github.run_number }}.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "$APK"
+          gh release create "apk-${{ github.run_number }}" "$APK" --prerelease --target "$GITHUB_SHA" \
+            --title "AXON debug build ${{ github.run_number }}" \
+            --notes "Debug APK from build ${{ github.run_number }} (commit $GITHUB_SHA). Tap the .apk file to download and install it." \
+            || echo "Could not publish the release this time (not fatal; use the zipped artifact)."
+          # keep only the 5 newest apk-* releases so the repository does not fill up
+          gh release list --limit 100 --json tagName -q '.[].tagName' | grep '^apk-' | tail -n +6 | while read -r t; do
+            gh release delete "$t" --cleanup-tag -y || true
+          done
+
+      - name: Lock newly added files (the lock only grows; refuses if anything is damaged)
+        if: success()
+        run: |
+          node tools/guard.mjs --ratchet
+          if [ -n "$(git status --porcelain tools/files.lock)" ]; then
+            git config user.name "axon-guard"
+            git config user.email "axon-guard@users.noreply.github.com"
+            git add tools/files.lock
+            git commit -m "Guard: lock newly added files"
+            git push || echo "Could not save the lock this time (not fatal)."
+          fi
+
+      - name: Upload generated lockfile
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: package-lock
+          path: package-lock.json
+          if-no-files-found: warn
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## AXON build summary"
+            echo "- Web build: ${{ steps.webbuild.outcome }}"
+            echo "- Type check: ${{ steps.typecheck.outcome }}"
+            echo "- Background tests: ${{ steps.tests.outcome }}"
+            echo "- Kernel tests: ${{ steps.kerneltests.outcome }}"
+            echo "- Chat session tests: ${{ steps.chattests.outcome }}"
+            echo "- Debug APK: ${{ steps.apk.outcome }}"
+            echo "- APK download: Releases, apk-${{ github.run_number }} (plain .apk)"
+            echo "- Test gate (AXON_GATE): ${{ vars.AXON_GATE || 'off' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
